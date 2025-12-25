@@ -14,6 +14,8 @@ class ASRManager {
   constructor(dbInstance = null) {
     this.whisperService = null; // 延迟初始化
     this.db = dbInstance || new DatabaseManager();
+    // 如果外部传入 db，则不应在 destroy() 中关闭它（它可能是主进程共享的单例）
+    this._ownsDb = !dbInstance;
     this.isInitialized = false;
     this.isRunning = false;
 
@@ -799,8 +801,18 @@ class ASRManager {
   destroy() {
     this.stop();
     this.clearAllSilenceTimers();
-    this.whisperService.destroy();
-    this.db.close();
+    try {
+      this.whisperService?.destroy?.();
+    } catch (error) {
+      logger.error('Error destroying whisper service:', error);
+    }
+    if (this._ownsDb) {
+      try {
+        this.db?.close?.();
+      } catch (error) {
+        logger.error('Error closing DB in ASRManager.destroy:', error);
+      }
+    }
     this.isInitialized = false;
     logger.log('ASRManager destroyed');
   }

@@ -253,7 +253,27 @@ function Hud() {
     }
   }, [chatSession.sessionInfo]);
 
-  const handleSwitchSession = () => {
+  const handleSwitchSession = async () => {
+    // 进入会话选择前，先停止采集/ASR，避免“旧会话仍在跑”导致回调叠加或写入错会话
+    if (isListening) {
+      try {
+        await audioCaptureService.stopAllCaptures();
+      } catch (err) {
+        console.error('[HUD] Failed to stop captures before switching session:', err);
+      }
+      try {
+        const api = window.electronAPI;
+        if (api?.asrStop) {
+          await api.asrStop();
+        }
+      } catch (err) {
+        console.error('[HUD] Failed to stop ASR before switching session:', err);
+      }
+      setIsListening(false);
+      setMicVolumeLevel(0);
+      setSystemVolumeLevel(0);
+    }
+
     setShowSelector(true);
     setViewMode('full');
     chatSession.handleSwitchSession();
