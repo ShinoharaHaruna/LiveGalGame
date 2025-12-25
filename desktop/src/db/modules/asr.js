@@ -271,6 +271,19 @@ export default function ASRManager(BaseClass) {
       return stmt.get(id);
     }
 
+    // 通过音频文件路径获取语音识别记录（用于安全地回放/删除录音）
+    getSpeechRecordByAudioPath(audioFilePath) {
+      if (!audioFilePath) return null;
+      const stmt = this.db.prepare(`
+      SELECT sr.*, asrc.name as source_name
+      FROM speech_recognition_records sr
+      LEFT JOIN audio_sources asrc ON sr.source_id = asrc.id
+      WHERE sr.audio_file_path = ?
+      LIMIT 1
+    `);
+      return stmt.get(audioFilePath);
+    }
+
     // 更新语音识别记录
     updateSpeechRecord(id, updates) {
       const fields = [];

@@ -52,23 +52,35 @@ export default function ConversationManager(BaseClass) {
     return stmt.get(id);
   }
 
-  // 更新对话
-  updateConversation(id, updates) {
-    const fields = [];
-    const values = { id };
+	  // 更新对话
+	  updateConversation(id, updates) {
+	    const allowedFields = new Set([
+	      'character_id',
+	      'title',
+	      'date',
+	      'affinity_change',
+	      'summary',
+	      'tags'
+	    ]);
+	    const fields = [];
+	    const values = { id };
 
-    for (const [key, value] of Object.entries(updates)) {
-      if (key !== 'id') {
-        fields.push(`${key} = @${key}`);
-        values[key] = value;
-      }
-    }
+	    for (const [key, value] of Object.entries(updates)) {
+	      if (allowedFields.has(key)) {
+	        fields.push(`${key} = @${key}`);
+	        values[key] = value;
+	      }
+	    }
 
-    fields.push('updated_at = @updated_at');
-    values.updated_at = Date.now();
+	    if (fields.length === 0) {
+	      return this.getConversationById(id);
+	    }
 
-    const stmt = this.db.prepare(`
-      UPDATE conversations
+	    fields.push('updated_at = @updated_at');
+	    values.updated_at = Date.now();
+
+	    const stmt = this.db.prepare(`
+	      UPDATE conversations
       SET ${fields.join(', ')}
       WHERE id = @id
     `);

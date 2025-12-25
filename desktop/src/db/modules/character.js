@@ -63,23 +63,35 @@ export default function CharacterManager(BaseClass) {
     };
   }
 
-  // 更新角色
-  updateCharacter(id, updates) {
-    const fields = [];
-    const values = { id };
+	  // 更新角色
+	  updateCharacter(id, updates) {
+	    const allowedFields = new Set([
+	      'name',
+	      'nickname',
+	      'relationship_label',
+	      'avatar_color',
+	      'affinity',
+	      'notes'
+	    ]);
+	    const fields = [];
+	    const values = { id };
 
-    for (const [key, value] of Object.entries(updates)) {
-      if (key !== 'id' && key !== 'tags') {
-        fields.push(`${key} = @${key}`);
-        values[key] = value;
-      }
-    }
+	    for (const [key, value] of Object.entries(updates)) {
+	      if (allowedFields.has(key)) {
+	        fields.push(`${key} = @${key}`);
+	        values[key] = value;
+	      }
+	    }
 
-    fields.push('updated_at = @updated_at');
-    values.updated_at = Date.now();
+	    if (fields.length === 0) {
+	      return this.getCharacterById(id);
+	    }
 
-    const stmt = this.db.prepare(`
-      UPDATE characters
+	    fields.push('updated_at = @updated_at');
+	    values.updated_at = Date.now();
+
+	    const stmt = this.db.prepare(`
+	      UPDATE characters
       SET ${fields.join(', ')}
       WHERE id = @id
     `);

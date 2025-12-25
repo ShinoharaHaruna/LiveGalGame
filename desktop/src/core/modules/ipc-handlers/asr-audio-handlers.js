@@ -1,4 +1,30 @@
 import { ipcMain } from 'electron';
+import path from 'path';
+import * as fs from 'node:fs/promises';
+
+const MAX_AUDIO_BYTES = 50 * 1024 * 1024; // 50MB (base64 会更大，限制避免主进程内存被打爆)
+const ALLOWED_AUDIO_EXTS = new Set(['.wav', '.webm']);
+
+function normalizeFilePathInput(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  // Null byte guard (avoid odd filesystem behavior)
+  if (trimmed.includes('\0')) return null;
+  return trimmed;
+}
+
+function resolvePathSafe(value) {
+  const raw = normalizeFilePathInput(value);
+  if (!raw) return null;
+  return path.resolve(raw);
+}
+
+function isAllowedAudioPath(filePath) {
+  if (!filePath) return false;
+  const ext = path.extname(filePath).toLowerCase();
+  return ALLOWED_AUDIO_EXTS.has(ext);
+}
 
 /**
  * 注册 ASR 音频处理相关 IPC 处理器
@@ -217,12 +243,48 @@ export function registerASRAudioHandlers({
 
   ipcMain.handle('asr-get-audio-data-url', async (event, filePath) => {
     try {
-      if (!filePath) return null;
-      const fs = await import('fs/promises');
-      const buffer = await fs.readFile(filePath);
+      const rawPath = normalizeFilePathInput(filePath);
+      if (!rawPath) return null;
+
+      // 关键安全点：仅允许读取「数据库里已有记录」的音频文件路径，避免渲染进程任意读本机文件。
+      // UI 传入的 filePath 正常情况下就是 record.audio_file_path。
+      const record =
+        (typeof db.getSpeechRecordByAudioPath === 'function' ? db.getSpeechRecordByAudioPath(rawPath) : null)
+        || (typeof db.getSpeechRecordByAudioPath === 'function' ? db.getSpeechRecordByAudioPath(path.resolve(rawPath)) : null);
+
+      if (!record?.audio_file_path) {
+        console.warn('[ASR] audio data url requested for unknown path (not in DB)');
+        return null;
+      }
+
+      const resolvedRecordPath = resolvePathSafe(record.audio_file_path);
+      const resolvedRequestPath = resolvePathSafe(rawPath);
+      if (!resolvedRecordPath || !resolvedRequestPath) return null;
+
+      // 防止 “传入一个不同路径但指向同一文件” 的绕过：尽可能用 realpath 做一致性校验
+      const realRecordPath = await fs.realpath(resolvedRecordPath).catch(() => resolvedRecordPath);
+      const realRequestPath = await fs.realpath(resolvedRequestPath).catch(() => resolvedRequestPath);
+      if (realRecordPath !== realRequestPath) {
+        console.warn('[ASR] audio data url path mismatch', { realRecordPath, realRequestPath });
+        return null;
+      }
+
+      if (!isAllowedAudioPath(realRecordPath)) {
+        console.warn('[ASR] audio data url rejected due to extension', realRecordPath);
+        return null;
+      }
+
+      const stat = await fs.stat(realRecordPath).catch(() => null);
+      if (!stat?.isFile?.()) return null;
+      if (stat.size > MAX_AUDIO_BYTES) {
+        console.warn('[ASR] audio data url rejected due to size', { size: stat.size, max: MAX_AUDIO_BYTES });
+        return null;
+      }
+
+      const buffer = await fs.readFile(realRecordPath);
       const base64 = buffer.toString('base64');
       // Assume WAV for simplicity, or detect from extension
-      const ext = filePath.split('.').pop().toLowerCase();
+      const ext = realRecordPath.split('.').pop().toLowerCase();
       const mimeType = ext === 'webm' ? 'audio/webm' : 'audio/wav';
       return `data:${mimeType};base64,${base64}`;
     } catch (error) {
@@ -233,21 +295,43 @@ export function registerASRAudioHandlers({
 
   ipcMain.handle('asr-delete-audio-file', async (event, { recordId, filePath }) => {
     try {
-      const asrManager = getOrCreateASRManager();
-
-      // Delete physical file
-      if (filePath) {
-        const fs = await import('fs/promises');
-        await fs.unlink(filePath).catch(err => {
-          console.warn('Physical file already gone or could not be deleted:', err);
-        });
+      if (!recordId) {
+        return { success: false, error: 'recordId is required' };
       }
 
-      // Update database
-      if (recordId) {
+      const record = db.getSpeechRecordById(recordId);
+      if (!record) {
+        return { success: false, error: `Speech record not found: ${recordId}` };
+      }
+
+      const expectedPath = record.audio_file_path || null;
+      if (!expectedPath) {
+        // 数据库里已经没有关联文件了：当作成功（幂等）
         db.deleteSpeechRecordAudio(recordId);
+        return { success: true, skipped: true };
       }
 
+      // 关键安全点：不信任渲染进程传入的 filePath，只允许删除与 recordId 绑定的那一个文件。
+      if (filePath) {
+        const expectedResolved = resolvePathSafe(expectedPath);
+        const providedResolved = resolvePathSafe(filePath);
+        if (expectedResolved && providedResolved && expectedResolved !== providedResolved) {
+          return { success: false, error: 'filePath does not match recordId' };
+        }
+      }
+
+      const resolved = resolvePathSafe(expectedPath);
+      if (!resolved || !isAllowedAudioPath(resolved)) {
+        return { success: false, error: 'Invalid audio file path' };
+      }
+
+      const realPath = await fs.realpath(resolved).catch(() => resolved);
+      await fs.unlink(realPath).catch((err) => {
+        if (err?.code === 'ENOENT') return;
+        console.warn('Physical file already gone or could not be deleted:', err);
+      });
+
+      db.deleteSpeechRecordAudio(recordId);
       return { success: true };
     } catch (error) {
       console.error('Error deleting audio file:', error);
@@ -257,4 +341,3 @@ export function registerASRAudioHandlers({
 
   console.log('ASR Audio IPC handlers registered');
 }
-
