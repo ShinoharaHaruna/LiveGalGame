@@ -6,7 +6,7 @@
   "main": "src/main.js",
   "scripts": {
     "predev": "node scripts/ensure-port-free.js",
-    "dev": "chcp 65001 > nul && pnpm run predev && concurrently -k \"vite\" \"npm run dev:electron\"",
+    "dev": "node scripts/dev.js",
     "dev:log": "node scripts/dev-log.js",
     "dev:electron": "cross-env NODE_ENV=development PYTHONIOENCODING=utf-8 electron . --enable-logging",
     "dev:vite": "vite",
