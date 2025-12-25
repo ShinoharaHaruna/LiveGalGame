@@ -126,12 +126,6 @@ B站视频：[【修复了GalGame玩家和女生聊天没有字幕的Bug】](htt
 
 ---
 
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=JStone2934/LiveGalGame&type=Date)](https://star-history.com/#JStone2934/LiveGalGame&Date)
-
----
-
 ## 🤝 加入我们
 
 **QQ 群：1074602400**
