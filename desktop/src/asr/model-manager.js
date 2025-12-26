@@ -277,11 +277,11 @@ export default class ASRModelManager extends EventEmitter {
     const funasrCacheDirs = [
       path.join(os.homedir(), '.cache', 'modelscope', 'hub'),
       path.join(os.homedir(), '.cache', 'modelscope', 'hub', 'models'),
-      this.msCache,
-      path.join(this.msCache, 'models'),
+      this.msCacheHub,
+      this.msCacheHub ? path.join(this.msCacheHub, 'models') : null,
       this.systemMsCache,
       path.join(this.systemMsCache, 'models'),
-    ];
+    ].filter(Boolean);
 
     let totalDownloadedBytes = 0;
     let modelsFound = 0;
@@ -659,7 +659,7 @@ export default class ASRModelManager extends EventEmitter {
         if (payload.source === 'modelscope') {
           const resolvedMsPath =
             getModelScopeRepoPath(this.cacheDir, ctx.repoId) ||
-            getModelScopeRepoPath(this.msCache, ctx.repoId) ||
+            getModelScopeRepoPath(this.msCacheHub, ctx.repoId) ||
             getModelScopeRepoPath(this.systemMsCache, ctx.repoId) ||
             getModelScopeRepoPath(this.systemHfCache, ctx.repoId);
           if (resolvedMsPath) {
@@ -710,7 +710,7 @@ export default class ASRModelManager extends EventEmitter {
     if ((!ctx.snapshotPath || !fs.existsSync(ctx.snapshotPath)) && ctx.source === 'modelscope') {
       const resolvedMsPath =
         getModelScopeRepoPath(this.cacheDir, ctx.repoId) ||
-        getModelScopeRepoPath(this.msCache, ctx.repoId) ||
+        getModelScopeRepoPath(this.msCacheHub, ctx.repoId) ||
         getModelScopeRepoPath(this.systemMsCache, ctx.repoId) ||
         getModelScopeRepoPath(this.systemHfCache, ctx.repoId);
       if (resolvedMsPath) {
