@@ -352,6 +352,14 @@ class AudioCaptureService {
     try {
       const inputData = event.inputBuffer.getChannelData(0);
 
+      // 【调试】每 100 次回调打印一次，确认音频流是否正常
+      // if (!this._processCount) this._processCount = {};
+      // if (!this._processCount[sourceId]) this._processCount[sourceId] = 0;
+      // this._processCount[sourceId]++;
+      // if (this._processCount[sourceId] % 100 === 1) {
+      //   console.log(`[AudioCaptureService] 🔄 handleAudioProcess for ${sourceId}, count: ${this._processCount[sourceId]}, inputLength: ${inputData.length}`);
+      // }
+
       // 计算实时音量 (RMS)
       let sumSquared = 0;
       for (let i = 0; i < inputData.length; i++) {
