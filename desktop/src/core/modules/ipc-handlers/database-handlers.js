@@ -177,6 +177,46 @@ export function registerDatabaseHandlers({ db }) {
     }
   });
 
+  ipcMain.handle('db-save-character-details', (event, characterId, details) => {
+    try {
+      const normalizedDetails = {
+        ...(details || {}),
+        character_id: characterId,
+        updated_at: Date.now()
+      };
+
+      // 1) 先保存详情表
+      const ok = db.saveCharacterDetails(characterId, normalizedDetails);
+
+      // 2) 如果详情里包含 profile，则同步更新 characters 主表，避免 UI 列表与详情不一致
+      const profile = normalizedDetails?.profile;
+      if (profile && typeof profile === 'object') {
+        const updates = {};
+        const allowed = [
+          'name',
+          'nickname',
+          'relationship_label',
+          'avatar_color',
+          'affinity',
+          'notes'
+        ];
+        for (const key of allowed) {
+          if (Object.prototype.hasOwnProperty.call(profile, key)) {
+            updates[key] = profile[key];
+          }
+        }
+        if (Object.keys(updates).length > 0) {
+          db.updateCharacter(characterId, updates);
+        }
+      }
+
+      return !!ok;
+    } catch (error) {
+      console.error('Error saving character details:', error);
+      return false;
+    }
+  });
+
   ipcMain.handle(
     'db-update-character-details-custom-fields',
     (event, characterId, customFields) => {

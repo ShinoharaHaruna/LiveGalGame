@@ -144,6 +144,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getConversationAIData: (conversationId) => ipcRenderer.invoke('db-get-conversation-ai-data', conversationId),
   selectActionSuggestion: (payload) => ipcRenderer.invoke('db-select-action-suggestion', payload),
   getCharacterDetails: (characterId) => ipcRenderer.invoke('db-get-character-details', characterId),
+  saveCharacterDetails: (characterId, details) =>
+    ipcRenderer.invoke('db-save-character-details', characterId, details),
   updateCharacterDetailsCustomFields: (characterId, customFields) => ipcRenderer.invoke('db-update-character-details-custom-fields', characterId, customFields),
   regenerateCharacterDetails: (characterId) => ipcRenderer.invoke('db-regenerate-character-details', characterId),
   deleteConversation: (conversationId) => ipcRenderer.invoke('db-delete-conversation', conversationId),
