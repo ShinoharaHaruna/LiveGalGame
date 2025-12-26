@@ -72,12 +72,67 @@ jobs:
         with:
           python-version: '3.10'
 
+      # Windows: 安装 Visual Studio Build Tools（用于编译 native 模块）
+      - name: Setup MSVC Build Tools (Windows only)
+        if: matrix.platform == 'win'
+        uses: microsoft/setup-msbuild@v2
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # Windows: 确保 app-builder.exe 存在且可执行
+      - name: Verify and fix app-builder (Windows only)
+        if: matrix.platform == 'win'
+        shell: pwsh
+        run: |
+          # 查找 app-builder.exe
+          $appBuilder = Get-ChildItem -Path "node_modules" -Recurse -Filter "app-builder.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          
+          if ($appBuilder) {
+            Write-Host "Found app-builder.exe at: $($appBuilder.FullName)"
+            Write-Host "File size: $($appBuilder.Length) bytes"
+            
+            # 验证文件是否为有效的 PE 文件
+            $bytes = [System.IO.File]::ReadAllBytes($appBuilder.FullName)
+            if ($bytes[0] -eq 0x4D -and $bytes[1] -eq 0x5A) {
+              Write-Host "✓ Valid PE executable"
+            } else {
+              Write-Warning "File may be corrupted, reinstalling..."
+              Remove-Item -Recurse -Force "node_modules/app-builder-bin" -ErrorAction SilentlyContinue
+              Remove-Item -Recurse -Force "node_modules/.pnpm/app-builder-bin*" -ErrorAction SilentlyContinue
+              pnpm install --frozen-lockfile
+            }
+          } else {
+            Write-Warning "app-builder.exe not found, attempting reinstall..."
+            pnpm install --frozen-lockfile
+          }
+          
+          # 再次验证
+          $appBuilder = Get-ChildItem -Path "node_modules" -Recurse -Filter "app-builder.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $appBuilder) {
+            Write-Error "app-builder.exe still not found after reinstall!"
+            exit 1
+          }
 
       - name: Prepare Python env for ASR backend
         working-directory: desktop
         run: pnpm run prepare:python
+
+      # 验证 Python 环境和 PyInstaller
+      - name: Verify Python environment
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "win" ]; then
+            PYTHON_PATH="${{ github.workspace }}/desktop/python-env/Scripts/python.exe"
+          else
+            PYTHON_PATH="${{ github.workspace }}/desktop/python-env/bin/python3"
+          fi
+          echo "Python path: $PYTHON_PATH"
+          "$PYTHON_PATH" --version
+          "$PYTHON_PATH" -m pip list | head -30
+          "$PYTHON_PATH" -c "import PyInstaller; print('PyInstaller OK')" || echo "PyInstaller import check failed"
+          echo "Checking for PyInstaller module..."
+          "$PYTHON_PATH" -m PyInstaller --version || true
 
       - name: Print app version
         id: meta
@@ -90,12 +145,31 @@ jobs:
           PYTHON: ${{ matrix.python }}
           ASR_IMPL: ${{ matrix.asr }}
           ASR_PYTHON_PATH: ${{ matrix.platform == 'win' && format('{0}/desktop/python-env/Scripts/python.exe', github.workspace) || format('{0}/desktop/python-env/bin/python3', github.workspace) }}
+          # Windows: 增加调试日志级别
+          DEBUG: ${{ matrix.platform == 'win' && 'electron-builder' || '' }}
         run: |
+          echo "=== Build Environment ==="
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Arch: ${{ matrix.arch }}"
+          echo "ASR_PYTHON_PATH: $ASR_PYTHON_PATH"
+          echo "========================="
+          
           if [ "${{ matrix.platform }}" = "mac" ]; then
             pnpm run build:mac -- --${{ matrix.arch }}
           else
             pnpm run build:win -- --${{ matrix.arch }}
           fi
+
+      # Windows: 列出构建产物帮助调试
+      - name: List build artifacts
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Release directory contents ==="
+          ls -la release/ || echo "release/ not found"
+          echo "=== Backend dist contents ==="
+          ls -la backend/dist/ || echo "backend/dist/ not found"
+          ls -la backend/dist/asr-backend/ 2>/dev/null | head -20 || echo "asr-backend dir not found"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

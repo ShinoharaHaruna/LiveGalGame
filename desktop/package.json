@@ -12,7 +12,6 @@
     "dev:vite": "vite",
     "download-models": "node scripts/download-models.js",
     "update-asr-model": "node scripts/update-asr-model.js",
-    "setup-funasr": "bash scripts/setup-funasr.sh",
     "build:native": "node-gyp rebuild --directory=src/native/system-audio-capture",
     "rebuild:better-sqlite3": "electron-rebuild -f -w better-sqlite3",
     "rebuild:native": "electron-rebuild -f -w system_audio_capture",
