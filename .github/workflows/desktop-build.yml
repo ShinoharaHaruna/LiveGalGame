@@ -33,15 +33,19 @@ jobs:
             arch: arm64
             python: python3.10
             asr: funasr-onnx
-            artifact_path: |
-              desktop/release/*.dmg
+            python_env_exe: python-env/bin/python3
+            build_script: build:mac
+            debug: ""
+            artifact_glob: desktop/release/*.dmg
           - os: windows-latest
             platform: win
             arch: x64
             python: python
             asr: funasr-onnx
-            artifact_path: |
-              desktop/release/*.exe
+            python_env_exe: python-env/Scripts/python.exe
+            build_script: build:win
+            debug: electron-builder
+            artifact_glob: desktop/release/*.exe
 
     defaults:
       run:
@@ -115,21 +119,17 @@ jobs:
           }
 
       - name: Prepare Python env for ASR backend
-        working-directory: desktop
         run: pnpm run prepare:python
 
       # 验证 Python 环境和 PyInstaller
       - name: Verify Python environment
-        shell: bash
         run: |
-          if [ "${{ matrix.platform }}" = "win" ]; then
-            PYTHON_PATH="${{ github.workspace }}/desktop/python-env/Scripts/python.exe"
-          else
-            PYTHON_PATH="${{ github.workspace }}/desktop/python-env/bin/python3"
-          fi
+          PYTHON_PATH="${{ format('{0}/desktop/{1}', github.workspace, matrix.python_env_exe) }}"
           echo "Python path: $PYTHON_PATH"
           "$PYTHON_PATH" --version
-          "$PYTHON_PATH" -m pip list | head -30
+          # 注意：在 bash -o pipefail 下，`pip list | head -30` 会因为 head 提前关闭 stdout 触发 BrokenPipe（exit 120），从而让 CI 失败。
+          # 这里用 sed 打印前 30 行但不提前关闭管道，避免 BrokenPipe。
+          "$PYTHON_PATH" -m pip list | sed -n '1,30p'
           "$PYTHON_PATH" -c "import PyInstaller; print('PyInstaller OK')" || echo "PyInstaller import check failed"
           echo "Checking for PyInstaller module..."
           "$PYTHON_PATH" -m PyInstaller --version || true
@@ -144,9 +144,8 @@ jobs:
         env:
           PYTHON: ${{ matrix.python }}
           ASR_IMPL: ${{ matrix.asr }}
-          ASR_PYTHON_PATH: ${{ matrix.platform == 'win' && format('{0}/desktop/python-env/Scripts/python.exe', github.workspace) || format('{0}/desktop/python-env/bin/python3', github.workspace) }}
-          # Windows: 增加调试日志级别
-          DEBUG: ${{ matrix.platform == 'win' && 'electron-builder' || '' }}
+          ASR_PYTHON_PATH: ${{ format('{0}/desktop/{1}', github.workspace, matrix.python_env_exe) }}
+          DEBUG: ${{ matrix.debug }}
         run: |
           echo "=== Build Environment ==="
           echo "Platform: ${{ matrix.platform }}"
@@ -154,28 +153,23 @@ jobs:
           echo "ASR_PYTHON_PATH: $ASR_PYTHON_PATH"
           echo "========================="
           
-          if [ "${{ matrix.platform }}" = "mac" ]; then
-            pnpm run build:mac -- --${{ matrix.arch }}
-          else
-            pnpm run build:win -- --${{ matrix.arch }}
-          fi
+          pnpm run ${{ matrix.build_script }} -- --${{ matrix.arch }}
 
       # Windows: 列出构建产物帮助调试
       - name: List build artifacts
         if: always()
-        shell: bash
         run: |
           echo "=== Release directory contents ==="
           ls -la release/ || echo "release/ not found"
           echo "=== Backend dist contents ==="
           ls -la backend/dist/ || echo "backend/dist/ not found"
-          ls -la backend/dist/asr-backend/ 2>/dev/null | head -20 || echo "asr-backend dir not found"
+          ls -la backend/dist/asr-backend/ 2>/dev/null | sed -n '1,20p' || echo "asr-backend dir not found"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: livegalgame-desktop-${{ matrix.platform }}-${{ matrix.arch }}-v${{ steps.meta.outputs.app_version }}
-          path: ${{ matrix.artifact_path }}
+          path: ${{ matrix.artifact_glob }}
           if-no-files-found: error
           retention-days: 14
 
