@@ -8,6 +8,58 @@ import os from 'os';
 import { getAsrCacheBaseSetting } from './core/app-settings.js';
 import { applyAsrCacheEnv } from './asr/asr-cache-env.js';
 
+// 获取 __dirname 的 ESM 等效方式 (提前定义，用于 dotenv 路径)
+const __filename_early = fileURLToPath(import.meta.url);
+const __dirname_early = path.dirname(__filename_early);
+
+// 手动加载 .env 文件（Electron 主进程不会自动加载）
+function loadDotEnv() {
+  // 尝试多个可能的 .env 文件位置
+  const possiblePaths = [
+    path.resolve(__dirname_early, '..', '..', '.env'),  // desktop/.env
+    path.resolve(__dirname_early, '..', '.env'),        // desktop/src/.env (fallback)
+    path.resolve(process.cwd(), '.env'),                // 当前工作目录
+  ];
+
+  for (const envPath of possiblePaths) {
+    if (fs.existsSync(envPath)) {
+      try {
+        const content = fs.readFileSync(envPath, 'utf-8');
+        const lines = content.split('\n');
+        for (const line of lines) {
+          const trimmed = line.trim();
+          // 跳过空行和注释
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          // 解析 KEY=VALUE
+          const eqIndex = trimmed.indexOf('=');
+          if (eqIndex > 0) {
+            const key = trimmed.slice(0, eqIndex).trim();
+            let value = trimmed.slice(eqIndex + 1).trim();
+            // 移除引号
+            if ((value.startsWith('"') && value.endsWith('"')) ||
+                (value.startsWith("'") && value.endsWith("'"))) {
+              value = value.slice(1, -1);
+            }
+            // 不覆盖已存在的环境变量
+            if (!process.env[key]) {
+              process.env[key] = value;
+            }
+          }
+        }
+        console.log(`[ENV] Loaded .env from: ${envPath}`);
+        return true;
+      } catch (err) {
+        console.warn(`[ENV] Failed to load ${envPath}:`, err.message);
+      }
+    }
+  }
+  console.warn('[ENV] No .env file found');
+  return false;
+}
+
+// 在最早的时机加载环境变量
+loadDotEnv();
+
 // 初始化 electron-audio-loopback（必须在 app.whenReady 之前调用）
 initAudioLoopback();
 
@@ -17,10 +69,6 @@ import { IPCManager } from './core/modules/ipc-handlers.js';
 import { ShortcutManager } from './core/modules/shortcut-manager.js';
 import { ASRPreloader } from './core/modules/asr-preloader.js';
 import { PermissionManager } from './core/modules/permission-manager.js';
-
-// 获取 __dirname 的 ESM 等效方式
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // 全局实例
 let windowManager;
