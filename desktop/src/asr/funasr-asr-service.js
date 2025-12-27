@@ -16,11 +16,180 @@ function float32ToInt16Buffer(floatArray) {
   return Buffer.from(int16Array.buffer);
 }
 
+/**
+ * 单个 FunASR Worker 的封装
+ * 每个 Worker 处理一个音频源，避免内部状态冲突
+ */
+class FunASRWorker {
+  constructor(workerId, pythonPath, workerScriptPath, options = {}) {
+    this.workerId = workerId;
+    this.pythonPath = pythonPath;
+    this.workerScriptPath = workerScriptPath;
+    this.modelName = options.modelName || 'funasr-paraformer';
+    this.process = null;
+    this.isReady = false;
+    this.readyPromise = null;
+    this.readyResolver = null;
+    this.readyRejecter = null;
+    this.onSentenceComplete = options.onSentenceComplete || null;
+    this.onPartialResult = options.onPartialResult || null;
+    this.onCrash = options.onCrash || null;
+  }
+
+  async start() {
+    if (this.process) return;
+
+    this.readyPromise = new Promise((resolve, reject) => {
+      this.readyResolver = resolve;
+      this.readyRejecter = reject;
+    });
+
+    const env = {
+      ...process.env,
+      PYTHONUNBUFFERED: '1',
+      ASR_MODEL: this.modelName,
+      PYTHONIOENCODING: 'utf-8',
+      FUNASR_WORKER_ID: this.workerId, // 传递 worker ID 用于日志区分
+    };
+
+    logger.log(`[FunASR][${this.workerId}] Starting worker: ${this.pythonPath} ${this.workerScriptPath}`);
+
+    this.process = spawn(this.pythonPath, [this.workerScriptPath], { env });
+
+    this.process.stdout.on('data', (data) => {
+      const lines = data.toString().split('\n');
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line);
+          this.handleMessage(msg);
+        } catch (e) {
+          // 忽略非 JSON 输出
+        }
+      }
+    });
+
+    this.process.stderr.on('data', (data) => {
+      logger.log(`[FunASR][${this.workerId}] ${data.toString().trim()}`);
+    });
+
+    this.process.on('close', (code) => {
+      logger.warn(`[FunASR][${this.workerId}] Worker exited with code ${code}`);
+      this.process = null;
+      this.isReady = false;
+      if (this.onCrash) {
+        this.onCrash(code, this.workerId);
+      }
+      if (this.readyRejecter) {
+        this.readyRejecter(new Error(`Worker ${this.workerId} exited before ready (code ${code})`));
+        this.readyRejecter = null;
+        this.readyResolver = null;
+        this.readyPromise = null;
+      }
+    });
+
+    if (this.readyPromise) {
+      await this.readyPromise;
+    }
+  }
+
+  handleMessage(msg) {
+    if (msg.status === 'ready') {
+      logger.log(`[FunASR][${this.workerId}] Worker is ready`);
+      this.isReady = true;
+      if (this.readyResolver) {
+        this.readyResolver();
+        this.readyResolver = null;
+        this.readyRejecter = null;
+        this.readyPromise = null;
+      }
+    } else if (msg.type === 'partial') {
+      if (this.onPartialResult) {
+        this.onPartialResult({
+          sessionId: msg.session_id,
+          partialText: msg.text,
+          fullText: msg.full_text,
+          timestamp: msg.timestamp,
+          isSpeaking: true,
+          workerId: this.workerId,
+        });
+      }
+    } else if (msg.type === 'sentence_complete') {
+      if (this.onSentenceComplete) {
+        this.onSentenceComplete({
+          sessionId: msg.session_id,
+          text: msg.text,
+          timestamp: msg.timestamp,
+          trigger: msg.trigger || 'worker',
+          audioDuration: msg.audio_duration,
+          language: msg.language,
+          workerId: this.workerId,
+        });
+      }
+    } else if (msg.error) {
+      logger.error(`[FunASR][${this.workerId}] Worker error: ${msg.error}`);
+    }
+  }
+
+  send(msg) {
+    if (this.process && this.process.stdin.writable) {
+      this.process.stdin.write(JSON.stringify(msg) + '\n');
+    }
+  }
+
+  addAudioChunk(audioData, timestamp, sourceId) {
+    if (!this.process || !this.isReady) return;
+    if (!audioData || audioData.length === 0) return;
+
+    // 简单的静音检测
+    let sum = 0;
+    for (let i = 0; i < audioData.length; i += 1) {
+      sum += Math.abs(audioData[i]);
+    }
+    const average = sum / audioData.length;
+    if (average < 0.0015) return;
+
+    const buffer = float32ToInt16Buffer(audioData);
+    const base64Audio = buffer.toString('base64');
+
+    this.send({
+      type: 'streaming_chunk',
+      session_id: sourceId,
+      audio_data: base64Audio,
+      timestamp: timestamp,
+    });
+  }
+
+  forceCommit(sourceId) {
+    this.send({
+      type: 'force_commit',
+      session_id: sourceId,
+    });
+  }
+
+  resetSession(sourceId) {
+    this.send({
+      type: 'reset_session',
+      session_id: sourceId,
+    });
+  }
+
+  stop() {
+    if (this.process) {
+      this.process.kill();
+      this.process = null;
+    }
+    this.isReady = false;
+  }
+}
+
 class FunASRService {
   constructor() {
     this.modelName = 'funasr-paraformer';
     this.pythonPath = this.detectPythonPath();
-    this.workerProcess = null;
+    // 【并发修复】使用多个 Worker，每个音频源一个独立进程
+    this.workers = new Map(); // sourceId -> FunASRWorker
+    this.workerProcess = null; // 保留兼容性（单 worker 场景）
     this.isInitialized = false;
     this.onSentenceComplete = null;
     this.onPartialResult = null;
@@ -100,9 +269,13 @@ class FunASRService {
     // 检查 Python 环境
     await this.ensureFunASRInstalled();
 
-    await this.startWorker();
+    // 【并发修复】预先启动两个 Worker（speaker1 和 speaker2）
+    // 这样每个音频源有独立的 FunASR 模型实例，避免状态冲突
+    await this.startWorkerForSource('speaker1');
+    await this.startWorkerForSource('speaker2');
+
     this.isInitialized = true;
-    logger.log('[FunASR] Service initialized');
+    logger.log('[FunASR] Service initialized with multi-worker architecture');
     return true;
   }
 
@@ -116,125 +289,94 @@ class FunASRService {
     }
   }
 
-  async startWorker() {
-    if (this.workerProcess) return;
-
-    this.workerReadyPromise = new Promise((resolve, reject) => {
-      this.workerReadyResolver = resolve;
-      this.workerReadyRejecter = reject;
-    });
-
-    const args = [this.workerScriptPath];
-
-    // 设置环境变量
-    const env = {
-      ...process.env,
-      PYTHONUNBUFFERED: '1',
-      ASR_MODEL: this.modelName,
-      PYTHONIOENCODING: 'utf-8'
-    };
-
-    logger.log(`[FunASR] Spawning worker: ${this.pythonPath} ${args.join(' ')}`);
-
-    this.workerProcess = spawn(this.pythonPath, args, { env });
-
-    // 处理标准输出（来自 worker 的 JSON 消息）
-    this.workerProcess.stdout.on('data', (data) => {
-      const lines = data.toString().split('\n');
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const msg = JSON.parse(line);
-          this.handleWorkerMessage(msg);
-        } catch (e) {
-          // 忽略非 JSON 输出
-        }
+  /**
+   * 为指定的音频源启动一个独立的 Worker
+   * @param {string} sourceId - 音频源 ID (speaker1/speaker2)
+   */
+  async startWorkerForSource(sourceId) {
+    if (this.workers.has(sourceId)) {
+      const existing = this.workers.get(sourceId);
+      if (existing.isReady) {
+        return existing;
       }
-    });
-
-    // 处理标准错误（日志）
-    this.workerProcess.stderr.on('data', (data) => {
-      logger.log(`[FunASR][Worker] ${data.toString().trim()}`);
-    });
-
-    this.workerProcess.on('close', (code) => {
-      logger.warn(`[FunASR] Worker exited with code ${code}`);
-      this.workerProcess = null;
-      this.isInitialized = false;
-      if (this.onServerCrash) {
-        this.onServerCrash(code);
-      }
-      if (this.workerReadyRejecter) {
-        this.workerReadyRejecter(new Error(`Worker exited before ready (code ${code})`));
-        this.workerReadyRejecter = null;
-        this.workerReadyResolver = null;
-        this.workerReadyPromise = null;
-      }
-    });
-
-    if (this.workerReadyPromise) {
-      await this.workerReadyPromise;
+      // 如果 worker 存在但未就绪，先停止它
+      existing.stop();
     }
+
+    logger.log(`[FunASR] Starting dedicated worker for ${sourceId}`);
+
+    const worker = new FunASRWorker(sourceId, this.pythonPath, this.workerScriptPath, {
+      modelName: this.modelName,
+      onSentenceComplete: (result) => {
+        if (this.onSentenceComplete) {
+          this.onSentenceComplete(result);
+        }
+      },
+      onPartialResult: (result) => {
+        if (this.onPartialResult) {
+          this.onPartialResult(result);
+        }
+      },
+      onCrash: (code, workerId) => {
+        logger.error(`[FunASR] Worker ${workerId} crashed with code ${code}`);
+        this.workers.delete(workerId);
+        if (this.onServerCrash) {
+          this.onServerCrash(code);
+        }
+      },
+    });
+
+    await worker.start();
+    this.workers.set(sourceId, worker);
+
+    // 保持兼容性：将第一个 worker 的进程设置为 workerProcess
+    if (!this.workerProcess) {
+      this.workerProcess = worker.process;
+    }
+
+    return worker;
   }
 
-  handleWorkerMessage(msg) {
-    if (msg.type === 'partial') {
-      if (this.onPartialResult) {
-        this.onPartialResult({
-          sessionId: msg.session_id,
-          partialText: msg.text,
-          fullText: msg.full_text,
-          timestamp: msg.timestamp,
-          isSpeaking: true
-        });
+  /**
+   * 获取指定音频源的 Worker（如果不存在则创建）
+   * @param {string} sourceId - 音频源 ID
+   */
+  async getOrCreateWorker(sourceId) {
+    if (this.workers.has(sourceId)) {
+      const worker = this.workers.get(sourceId);
+      if (worker.isReady) {
+        return worker;
       }
-    } else if (msg.type === 'sentence_complete') {
-      if (this.onSentenceComplete) {
-        this.onSentenceComplete({
-          sessionId: msg.session_id,
-          text: msg.text,
-          timestamp: msg.timestamp,
-          trigger: msg.trigger || 'worker',
-          audioDuration: msg.audio_duration,
-          language: msg.language
-        });
-      }
-    } else if (msg.status === 'ready') {
-      logger.log('[FunASR] Worker is ready');
-      if (this.workerReadyResolver) {
-        this.workerReadyResolver();
-        this.workerReadyResolver = null;
-        this.workerReadyRejecter = null;
-        this.workerReadyPromise = null;
-      }
-    } else if (msg.error) {
-      logger.error(`[FunASR] Worker error: ${msg.error}`);
     }
+    return await this.startWorkerForSource(sourceId);
   }
 
   async addAudioChunk(audioData, timestamp, sourceId = 'default') {
-    if (!this.workerProcess) return;
-
     if (!audioData || audioData.length === 0) return;
 
     // 简单的静音检测
     if (this.detectSilence(audioData)) return;
 
-    const buffer = float32ToInt16Buffer(audioData);
-    const base64Audio = buffer.toString('base64');
+    // 【并发修复】获取该音频源专属的 Worker
+    let worker = this.workers.get(sourceId);
+    if (!worker || !worker.isReady) {
+      // 动态创建 Worker（兼容非预定义的 sourceId）
+      worker = await this.getOrCreateWorker(sourceId);
+    }
 
-    const msg = {
-      type: 'streaming_chunk',
-      session_id: sourceId,
-      audio_data: base64Audio,
-      timestamp: timestamp
-    };
-
-    this.sendToWorker(msg);
+    if (worker && worker.isReady) {
+      worker.addAudioChunk(audioData, timestamp, sourceId);
+    }
   }
 
   sendToWorker(msg) {
-    if (this.workerProcess && this.workerProcess.stdin.writable) {
+    // 兼容旧代码：根据 session_id 路由到对应的 Worker
+    const sourceId = msg.session_id || 'default';
+    const worker = this.workers.get(sourceId);
+    if (worker) {
+      worker.send(msg);
+    } else if (this.workerProcess && this.workerProcess.stdin.writable) {
+      // 回退到旧的单 worker 模式
       this.workerProcess.stdin.write(JSON.stringify(msg) + '\n');
     }
   }
@@ -249,10 +391,16 @@ class FunASRService {
   }
 
   async forceCommitSentence(sourceId = 'default') {
-    this.sendToWorker({
-      type: 'force_commit',
-      session_id: sourceId
-    });
+    const worker = this.workers.get(sourceId);
+    if (worker && worker.isReady) {
+      worker.forceCommit(sourceId);
+    } else {
+      // 回退到旧的单 worker 模式
+      this.sendToWorker({
+        type: 'force_commit',
+        session_id: sourceId,
+      });
+    }
   }
 
   async commitSentence() {
@@ -268,10 +416,13 @@ class FunASRService {
   }
 
   async stop() {
-    if (this.workerProcess) {
-      this.workerProcess.kill();
-      this.workerProcess = null;
+    // 【并发修复】停止所有 Worker
+    for (const [sourceId, worker] of this.workers) {
+      logger.log(`[FunASR] Stopping worker for ${sourceId}`);
+      worker.stop();
     }
+    this.workers.clear();
+    this.workerProcess = null;
     this.isInitialized = false;
   }
 
@@ -327,10 +478,16 @@ class FunASRService {
   }
 
   clearContext(sourceId) {
-    this.sendToWorker({
-      type: 'reset_session',
-      session_id: sourceId
-    });
+    const worker = this.workers.get(sourceId);
+    if (worker && worker.isReady) {
+      worker.resetSession(sourceId);
+    } else {
+      // 回退到旧的单 worker 模式
+      this.sendToWorker({
+        type: 'reset_session',
+        session_id: sourceId,
+      });
+    }
   }
 
   runPythonCommand(args) {

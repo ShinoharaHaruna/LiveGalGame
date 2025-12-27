@@ -240,21 +240,7 @@ function Hud() {
     };
   }, [suggestions]);
 
-  if (chatSession.sessionInfo && chatSession.sessionInfo.conversationId) {
-    messages.loadMessages();
-  }
-
-  if (chatSession.sessionInfo && chatSession.sessionInfo.conversationId) {
-    useEffect(() => {
-      messages.loadMessages();
-    }, [chatSession.sessionInfo.conversationId]);
-  }
-
-  if (chatSession.showSelector !== false && !chatSession.sessionInfo) {
-    chatSession.showSelector = true;
-  }
-
-  if (chatSession.showSelector || !chatSession.sessionInfo) {
+  if (!chatSession.sessionInfo) {
     return <SessionSelector onSessionSelected={chatSession.handleSessionSelected} onClose={chatSession.handleClose} />;
   }
 
@@ -284,7 +270,24 @@ function Hud() {
               {isListening && <rect x="14" y="4" width="4" height="16"></rect>}
             </svg>
           </button>
-          <button className="control-btn" onClick={chatSession.handleSwitchSession} title="切换会话">
+          <button className="control-btn" onClick={async () => {
+            // 切换会话前先停止 ASR 监听，避免事件重复触发
+            if (isListening) {
+              try {
+                await audioCaptureService.stopAllCaptures();
+                const api = window.electronAPI;
+                if (api?.asrStop) {
+                  await api.asrStop();
+                }
+              } catch (err) {
+                console.error('停止监听失败:', err);
+              }
+              setIsListening(false);
+              setMicVolumeLevel(0);
+              setSystemVolumeLevel(0);
+            }
+            chatSession.handleSwitchSession();
+          }} title="切换会话">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path>
               <path d="M21 3v5h-5"></path>

@@ -273,15 +273,20 @@ export default class ASRModelManager extends EventEmitter {
     const modelDirs = Object.values(onnxModels);
 
     // funasr_onnx 使用的缓存目录
-    // 注意：ModelScope 有时会将模型放在 hub/models/ 下，有时直接在 hub/ 下
+    // 注意：ModelScope 有时会将模型放在 hub/ 下，有时放在与 hub 同级的 models/ 下
+    // funasr_onnx 实际下载位置是 ~/.cache/modelscope/models/damo/...
     const funasrCacheDirs = [
+      // 优先检查 models 目录（funasr_onnx 实际下载位置）
+      path.join(os.homedir(), '.cache', 'modelscope', 'models'),
+      // 兼容其他可能的目录结构
       path.join(os.homedir(), '.cache', 'modelscope', 'hub'),
       path.join(os.homedir(), '.cache', 'modelscope', 'hub', 'models'),
-      this.msCache,
-      path.join(this.msCache, 'models'),
+      this.msCacheHub,
+      this.msCacheHub ? path.join(this.msCacheHub, 'models') : null,
+      this.msCacheBase ? path.join(this.msCacheBase, 'models') : null,
       this.systemMsCache,
       path.join(this.systemMsCache, 'models'),
-    ];
+    ].filter(Boolean);
 
     let totalDownloadedBytes = 0;
     let modelsFound = 0;
@@ -659,7 +664,7 @@ export default class ASRModelManager extends EventEmitter {
         if (payload.source === 'modelscope') {
           const resolvedMsPath =
             getModelScopeRepoPath(this.cacheDir, ctx.repoId) ||
-            getModelScopeRepoPath(this.msCache, ctx.repoId) ||
+            getModelScopeRepoPath(this.msCacheHub, ctx.repoId) ||
             getModelScopeRepoPath(this.systemMsCache, ctx.repoId) ||
             getModelScopeRepoPath(this.systemHfCache, ctx.repoId);
           if (resolvedMsPath) {
@@ -710,7 +715,7 @@ export default class ASRModelManager extends EventEmitter {
     if ((!ctx.snapshotPath || !fs.existsSync(ctx.snapshotPath)) && ctx.source === 'modelscope') {
       const resolvedMsPath =
         getModelScopeRepoPath(this.cacheDir, ctx.repoId) ||
-        getModelScopeRepoPath(this.msCache, ctx.repoId) ||
+        getModelScopeRepoPath(this.msCacheHub, ctx.repoId) ||
         getModelScopeRepoPath(this.systemMsCache, ctx.repoId) ||
         getModelScopeRepoPath(this.systemHfCache, ctx.repoId);
       if (resolvedMsPath) {

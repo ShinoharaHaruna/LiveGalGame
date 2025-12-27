@@ -24,6 +24,9 @@ const requirementsPath = path.join(projectRoot, 'requirements.txt');
 const isWin = process.platform === 'win32';
 const isMac = process.platform === 'darwin';
 const desiredPy = process.env.PYTHON_VERSION || '3.10';
+const prepareMode = (process.env.PREPARE_PYTHON_MODE || (process.env.CI === 'true' ? 'bundle' : 'dev')).toLowerCase();
+// auto: 开发模式优先使用 uv（若可用），bundle 模式优先使用 conda-pack（历史实现）
+const prepareTool = (process.env.PREPARE_PYTHON_TOOL || 'auto').toLowerCase();
 const candidateCmds = [
   process.env.PYTHON,                          // 用户显式指定
   isWin ? `py -${desiredPy}` : null,           // Windows 推荐 py 启动器
@@ -72,6 +75,21 @@ function detectPython() {
     }
   }
   return null;
+}
+
+function isCondaEnvPrefix(prefix) {
+  // conda 环境会有 conda-meta/history（比单纯判断 python 可执行文件可靠）
+  return fs.existsSync(path.join(prefix, 'conda-meta', 'history'));
+}
+
+function isVenvPrefix(prefix) {
+  // venv/virtualenv 会有 pyvenv.cfg
+  return fs.existsSync(path.join(prefix, 'pyvenv.cfg'));
+}
+
+function hasUv() {
+  const res = runCapture('uv --version', { stdio: 'pipe' });
+  return res.success;
 }
 
 function bootstrapMiniforge() {
@@ -147,9 +165,16 @@ function ensureCondaEnv(miniforgePython, { forceRebuild = false } = {}) {
     fs.rmSync(venvDir, { recursive: true, force: true });
   }
 
+  // 关键修复：python-env 可能曾用 venv 创建过（没有 conda-meta），这会导致后续 mamba install 直接失败。
   if (fs.existsSync(pythonPath)) {
-    console.log(`[prepare-python-env] env already exists: ${pythonPath}`);
-    return;
+    if (isCondaEnvPrefix(venvDir)) {
+      console.log(`[prepare-python-env] conda env already exists: ${pythonPath}`);
+      return;
+    }
+    console.warn(
+      `[prepare-python-env] Detected existing python-env but it is NOT a conda env (missing conda-meta). Rebuilding: ${venvDir}`
+    );
+    fs.rmSync(venvDir, { recursive: true, force: true });
   }
 
   console.log(`[prepare-python-env] creating conda env (Python ${desiredPy}) at ${venvDir}`);
@@ -283,6 +308,31 @@ function packCondaEnv() {
   fs.rmSync(tarPath, { force: true });
 }
 
+function ensureUvVenv(pythonSpec, { forceRebuild = false, relocatable = false } = {}) {
+  const useRelocatable = relocatable ? '--relocatable' : '';
+  if (fs.existsSync(venvDir) && (forceRebuild || !isVenvPrefix(venvDir))) {
+    console.log(`[prepare-python-env] (uv) clearing existing env: ${venvDir}`);
+    // uv venv --clear 会清理目标目录；这里也兼容“目录存在但不是 venv”的情况
+    run(`uv venv "${venvDir}" --clear ${useRelocatable} --python "${pythonSpec}" --managed-python`);
+    return;
+  }
+  if (fs.existsSync(pythonPath) && isVenvPrefix(venvDir)) {
+    console.log(`[prepare-python-env] (uv) venv already exists: ${pythonPath}`);
+    return;
+  }
+  console.log(`[prepare-python-env] (uv) creating venv at ${venvDir} (python=${pythonSpec}${relocatable ? ', relocatable' : ''})`);
+  run(`uv venv "${venvDir}" ${useRelocatable} --python "${pythonSpec}" --managed-python`);
+}
+
+function installDepsWithUv() {
+  if (!fs.existsSync(requirementsPath)) {
+    throw new Error(`requirements.txt not found at ${requirementsPath}`);
+  }
+  console.log('[prepare-python-env] (uv) installing requirements via uv pip ...');
+  // uv 会自己处理 pip/resolve/缓存；这里显式指定目标 python
+  run(`uv pip install -r "${requirementsPath}" -p "${pythonPath}"`);
+}
+
 /**
  * 修复 venv 中的 Python 符号链接为实际文件副本
  * venv 创建的符号链接是绝对路径，打包后在其他机器上会失效
@@ -339,20 +389,41 @@ function main() {
     pythonCmd = bootstrapMiniforge();
   }
 
+  const toolAutoPreferUv = prepareTool === 'auto' && prepareMode === 'dev' && hasUv();
+  const useUv = prepareTool === 'uv' || toolAutoPreferUv;
+  const useBundle = prepareMode === 'bundle';
+
   if (isMac) {
-    const updatedPy = ensureCondaEnv(pythonCmd, { forceRebuild });
-    if (updatedPy) {
-      pythonCmd = updatedPy;
+    // macOS:
+    // - dev: 默认用 uv（若可用）创建 venv 并安装依赖，避免 Miniforge+conda-pack 的笨重流程
+    // - bundle: 默认使用 conda env + conda-pack，确保可搬运（打包发布）
+    if (useUv) {
+      // dev 默认不需要 relocatable；bundle 模式下允许用 uv 的 relocatable venv（实验性）
+      ensureUvVenv(desiredPy, { forceRebuild, relocatable: useBundle });
+      installDepsWithUv();
+      fixPythonSymlinks();
+    } else if (useBundle) {
+      const updatedPy = ensureCondaEnv(pythonCmd, { forceRebuild });
+      if (updatedPy) {
+        pythonCmd = updatedPy;
+      }
+      ensureCondaPackInstalled(pythonCmd);
+      // 以前这里安装 ffmpeg/av；当前默认 ONNX 推理不需要，且容易引入体积/失败点。
+      // 如确有需求，可通过 PREPARE_INSTALL_MEDIA_DEPS=1 启用。
+      if (process.env.PREPARE_INSTALL_MEDIA_DEPS === '1') {
+        installCondaPackages(['ffmpeg', 'av=11.*']);
+      }
+      installDeps();
+      packCondaEnv();
+      fixPythonSymlinks();
+    } else {
+      // mac dev 非 uv：走普通 venv + pip（比 conda-pack 更轻）
+      ensureVenv(pythonCmd, { forceRebuild });
+      installDeps();
+      fixPythonSymlinks();
     }
-    ensureCondaPackInstalled(pythonCmd);
-    installCondaPackages([
-      'ffmpeg',
-      'av=11.*',
-    ]);
-    installDeps();
-    packCondaEnv();
-    fixPythonSymlinks();
   } else {
+    // Windows/Linux：沿用 venv + pip（可选 uv 也可用，但先保持稳定）
     ensureVenv(pythonCmd, { forceRebuild });
     installDeps();
     fixPythonSymlinks();

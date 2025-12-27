@@ -13,6 +13,10 @@ onnxruntime==1.21.1
 
 # FunASR ONNX 运行时依赖（funasr_onnx 内部会 import）
 jieba>=0.42.1
-torch
 modelscope
+
+# 说明：
+# - 本项目桌面端默认使用 funasr-onnx + onnxruntime 做推理，不需要 PyTorch。
+# - 之前的 torch 主要会在 PyInstaller 分析阶段引入 torch.utils.tensorboard，导致 Windows CI 因缺少 tensorboard 失败。
+# - 如需完整 FunASR（非 ONNX）或训练/导出能力，请在单独环境中安装 torch（而不是默认打包依赖）。
 

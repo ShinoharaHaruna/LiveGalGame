@@ -82,22 +82,13 @@ def main():
         emit("error", modelId=args.model_id, message="funasr_onnx 库未安装，请先安装依赖。")
         sys.exit(1)
 
-    # 模拟 asr_funasr_worker.py 中的模型 ID 逻辑
-    is_large = "large" in args.model_id.lower()
-    
     # 定义模型路径 (与 worker 保持一致)
-    # 这些是默认值，worker 中允许通过环境变量覆盖，这里我们为了下载默认模型，使用默认值
+    # 注意: ModelScope ONNX 仓库只提供量化版 (model_quant.onnx)，必须使用 quantize=True
     vad_model_dir = "damo/speech_fsmn_vad_zh-cn-16k-common-onnx"
     punc_model_dir = "damo/punc_ct-transformer_zh-cn-common-vocab272727-onnx"
-    
-    if is_large:
-        online_model_dir = "damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx"
-        offline_model_dir = "damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx"
-        use_quantize = False
-    else:
-        online_model_dir = "damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx"
-        offline_model_dir = "damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx"
-        use_quantize = True
+    online_model_dir = "damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online-onnx"
+    offline_model_dir = "damo/speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx"
+    use_quantize = True  # 强制量化，因为 ONNX 仓库只提供 model_quant.onnx
 
     try:
         from funasr_onnx.vad_bin import Fsmn_vad

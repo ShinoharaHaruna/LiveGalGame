@@ -145,6 +145,18 @@ export function createSentenceHandlers(manager) {
         return updatedMessage;
       }
 
+      // 【幂等/去重】有些情况下（例如窗口/会话切换、后端重连、重复回调）同一句可能会被提交两次，
+      // 这里统一用 RecognitionCache 做一次保险，避免 UI/DB 出现重复消息。
+      if (manager.isDuplicateRecognition(sessionId, normalizedText, effectiveTimestamp)) {
+        logger.log(
+          `[Sentence Complete] Duplicate sentence detected, skipping create: "${normalizedText.substring(0, 50)}..." (${sessionId})`
+        );
+        if (isSegmentEnd) {
+          manager.commitCurrentSegment(sessionId);
+        }
+        return null;
+      }
+
       logger.log(`[Sentence Complete] Creating new message: "${normalizedText.substring(0, 50)}..." (trigger: ${trigger}, session: ${sessionId})`);
 
       const record = await manager.saveRecognitionRecord(sessionId, {

@@ -90,6 +90,14 @@ function main() {
     '--collect-all numpy',
     '--hidden-import funasr_onnx',
     '--hidden-import jieba',
+    // 排除不需要的 torch 子模块，避免 tensorboard 缺失导致构建失败
+    '--exclude-module torch.utils.tensorboard',
+    '--exclude-module tensorboard',
+    '--exclude-module torch.utils.bottleneck',
+    // 排除其他不需要的大型依赖，减小包体积
+    '--exclude-module matplotlib',
+    '--exclude-module PIL',
+    '--exclude-module cv2',
   ];
 
   // 统一使用 onedir，避免 onefile 的压缩/解压开销

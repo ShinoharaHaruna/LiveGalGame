@@ -19,6 +19,7 @@ import sys
 import time
 import traceback
 import base64
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -48,6 +49,9 @@ def send_ipc_message(data):
 # 环境变量配置
 # ==============================================================================
 os.environ.setdefault("TQDM_DISABLE", "1")
+
+# 【并发修复】Worker ID 用于日志区分，每个音频源有独立的 Worker 进程
+WORKER_ID = os.environ.get("FUNASR_WORKER_ID", "default")
 
 MODELSCOPE_CACHE = os.environ.get("MODELSCOPE_CACHE") or os.environ.get("ASR_CACHE_DIR")
 if MODELSCOPE_CACHE:
@@ -234,6 +238,60 @@ def decode_audio_chunk(audio_b64: str) -> np.ndarray:
     return audio_int16.astype(np.float32)  # funasr_onnx 接受 float32，不除以 32768
 
 
+def _clone_online_model_with_isolated_frontend(asr_online_template):
+    """
+    关键：funasr_onnx 的 ParaformerOnline 内部包含 WavFrontendOnline，
+    其内部有 reserve_waveforms/input_cache/lfr_splice_cache 等流式缓存。
+    如果多个 session 共享同一个 ParaformerOnline 实例，这些缓存会串线，导致并发时某一路“识别不到”。
+
+    这里做一个“轻量 clone”：
+    - 共享 ORT encoder/decoder session（模型权重不重复加载，内存更省）
+    - 但为每个 session 创建独立的 WavFrontendOnline（缓存隔离）
+    """
+    try:
+        # 注意：不要在模块 import 阶段引入 funasr_onnx，避免某些打包/路径场景下提前失败
+        from funasr_onnx.utils.frontend import WavFrontendOnline  # type: ignore
+    except Exception as e:
+        # 兜底：无法导入时直接返回模板（会退化为共享缓存；但至少不中断服务）
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] WARN: cannot import WavFrontendOnline: {e}\n")
+        sys.stderr.flush()
+        return asr_online_template
+
+    # shallow copy：复用 converter/tokenizer/pe/ort sessions 等重对象
+    model = copy.copy(asr_online_template)
+
+    try:
+        tpl_frontend = getattr(asr_online_template, "frontend", None)
+        tpl_opts = getattr(tpl_frontend, "opts", None)
+        frame_opts = getattr(tpl_opts, "frame_opts", None)
+        mel_opts = getattr(tpl_opts, "mel_opts", None)
+
+        model.frontend = WavFrontendOnline(
+            cmvn_file=getattr(tpl_frontend, "cmvn_file", None),
+            fs=int(getattr(frame_opts, "samp_freq", 16000)),
+            window=str(getattr(frame_opts, "window_type", "hamming")),
+            n_mels=int(getattr(mel_opts, "num_bins", 80)),
+            frame_length=float(getattr(frame_opts, "frame_length_ms", 25.0)),
+            frame_shift=float(getattr(frame_opts, "frame_shift_ms", 10.0)),
+            lfr_m=int(getattr(tpl_frontend, "lfr_m", 1)),
+            lfr_n=int(getattr(tpl_frontend, "lfr_n", 1)),
+            dither=float(getattr(frame_opts, "dither", 1.0)),
+        )
+    except Exception as e:
+        # 兜底：如果构造失败，至少尝试“复制+清空缓存”
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] WARN: isolate frontend failed, fallback copy+reset: {e}\n")
+        sys.stderr.flush()
+        try:
+            model.frontend = copy.copy(getattr(asr_online_template, "frontend", None))
+            if hasattr(model.frontend, "cache_reset"):
+                model.frontend.cache_reset()
+        except Exception:
+            # 最差情况：继续复用模板 frontend（可能仍存在串线）
+            model.frontend = getattr(asr_online_template, "frontend", None)
+
+    return model
+
+
 def smart_split_sentences(text: str) -> List[str]:
     """
     智能分句：基于标点符号将长文本切分成自然的句子。
@@ -351,10 +409,9 @@ def load_funasr_onnx_models(gpu_config: Optional[GPUConfig] = None):
     加载 funasr_onnx 模型 (VAD + 流式ASR + 离线ASR + 标点)
     
     支持的环境变量:
-    - ASR_MODEL: 模型 ID (funasr-paraformer / funasr-paraformer-large)
-        * funasr-paraformer: INT8 量化版，包体约 0.76GB（online/offline/punc/vad），速度更快
-        * funasr-paraformer-large: FP32 未量化，约 2.1GB（按 INT8→FP32 体积估算），精度更高
-    - ASR_QUANTIZE: 是否使用量化 (true/false)，默认根据模型类型自动选择
+    - ASR_MODEL: 模型 ID (默认 funasr-paraformer)
+        * funasr-paraformer: INT8 量化版，包体约 0.76GB（online/offline/punc/vad）
+        注意: ModelScope ONNX 仓库只提供量化版 (model_quant.onnx)，无非量化版可用
     - MODELSCOPE_OFFLINE: 离线模式，跳过网络请求直接使用本地缓存
     """
     try:
@@ -370,7 +427,6 @@ def load_funasr_onnx_models(gpu_config: Optional[GPUConfig] = None):
 
     # 读取模型配置
     model_id = os.environ.get("ASR_MODEL", "funasr-paraformer")
-    is_large = "large" in model_id.lower()
 
     device_info = detect_onnx_device()
     if gpu_config is not None:
@@ -385,19 +441,26 @@ def load_funasr_onnx_models(gpu_config: Optional[GPUConfig] = None):
         except Exception:
             device_info = detect_onnx_device()
     
-    # Large 版本默认不使用量化，精度更高
+    # 注意: ModelScope 上的 FunASR ONNX 模型仓库 (如 damo/speech_fsmn_vad_zh-cn-16k-common-onnx)
+    # 只提供了量化版 model_quant.onnx，不提供非量化版 model.onnx。
+    # 如果 quantize=False，funasr_onnx 会尝试从 PyTorch 模型导出 ONNX，
+    # 但这需要完整的 funasr 库（不是 funasr_onnx）。
+    # 因此，对于这些预编译的 ONNX 模型，必须强制使用量化版。
     quantize_env = os.environ.get("ASR_QUANTIZE", "").lower()
-    if quantize_env in ("true", "1", "yes"):
+    if quantize_env in ("false", "0", "no"):
+        # 用户显式禁用量化 - 发出警告但仍强制使用量化（因为没有非量化版可用）
+        sys.stderr.write(
+            "[FunASR Worker] Warning: ASR_QUANTIZE=false requested, but ModelScope ONNX models only provide quantized versions.\n"
+            "[FunASR Worker] Forcing quantize=True to avoid export failure.\n"
+        )
+        sys.stderr.flush()
         use_quantize = True
-    elif quantize_env in ("false", "0", "no"):
-        use_quantize = False
     else:
-        # 默认: 普通版量化，Large版不量化
-        use_quantize = not is_large
+        # 默认或显式启用量化：使用量化版（这是唯一可用的版本）
+        use_quantize = True
     
     sys.stderr.write(f"[FunASR Worker] Model ID: {model_id}\n")
-    sys.stderr.write(f"[FunASR Worker] Is Large model: {is_large}\n")
-    sys.stderr.write(f"[FunASR Worker] Use Quantize: {use_quantize}\n")
+    sys.stderr.write(f"[FunASR Worker] Use Quantize: {use_quantize} (ONNX repo only provides quantized models)\n")
     sys.stderr.write(f"[FunASR Worker] Offline mode: {OFFLINE_MODE}\n")
     sys.stderr.write(f"[FunASR Worker] Host: {platform.system()} {platform.release()} ({platform.machine()})\n")
     sys.stderr.write(f"[FunASR Worker] ASR_DEVICE={ASR_DEVICE}, ASR_DEVICE_ID={ASR_DEVICE_ID}\n")
@@ -406,7 +469,7 @@ def load_funasr_onnx_models(gpu_config: Optional[GPUConfig] = None):
         "[FunASR Worker] Inference device selection: "
         f"device={device_info.get('device')}, device_id={device_info.get('device_id')}, provider={device_info.get('provider')}\n"
     )
-    sys.stderr.write(f"[FunASR Worker] Preset size hint: {'~0.76GB INT8 (default)' if use_quantize else '~2.1GB FP32 (higher accuracy)'}\n")
+    sys.stderr.write(f"[FunASR Worker] Preset size hint: ~0.76GB INT8 (quantized ONNX models from ModelScope)\n")
     if OFFLINE_MODE:
         sys.stderr.write("[FunASR Worker] Loading ONNX models from local cache (offline mode)...\n")
     else:
@@ -568,11 +631,12 @@ def load_funasr_onnx_models(gpu_config: Optional[GPUConfig] = None):
 
 def handle_streaming_chunk(
     vad_model,
-    asr_online_model,
+    asr_online_model_template,
     asr_offline_model,
     punc_model,
     data: dict,
     sessions_cache: Dict[str, SessionState],
+    online_models_cache: Dict[str, object],
 ):
     """
     处理流式音频块 - 2-Pass 架构
@@ -624,14 +688,20 @@ def handle_streaming_chunk(
     # ==== Pass 1: 实时流式识别 ====
     if state.is_speaking:
         try:
-            partial_res = asr_online_model(
+            # 【关键修复】每个 session 使用独立的 online model（至少 frontend 缓存隔离）
+            online_model = online_models_cache.get(session_id)
+            if online_model is None:
+                online_model = _clone_online_model_with_isolated_frontend(asr_online_model_template)
+                online_models_cache[session_id] = online_model
+
+            partial_res = online_model(
                 audio_chunk,
                 param_dict={"cache": state.online_cache, "is_final": False},
             )
 
             if partial_res:
                 # 调试日志：查看实际返回的格式
-                sys.stderr.write(f"[FunASR Worker] DEBUG partial_res type={type(partial_res).__name__}, value={str(partial_res)[:100]}\n")
+                sys.stderr.write(f"[FunASR Worker][{WORKER_ID}][{session_id}] DEBUG partial_res type={type(partial_res).__name__}, value={str(partial_res)[:100]}\n")
                 sys.stderr.flush()
                 
                 # funasr_onnx 返回格式可能是:
@@ -664,7 +734,7 @@ def handle_streaming_chunk(
                 else:
                     text = str(item) if item else ""
                 
-                sys.stderr.write(f"[FunASR Worker] DEBUG extracted text=\"{text[:50]}...\"\n")
+                sys.stderr.write(f"[FunASR Worker][{WORKER_ID}][{session_id}] DEBUG extracted text=\"{text[:50]}...\"\n")
                 sys.stderr.flush()
                 
                 if text:
@@ -683,9 +753,10 @@ def handle_streaming_chunk(
                             "is_final": False,
                             "status": "success",
                             "language": "zh",
+                            "worker_id": WORKER_ID,
                         })
                         state.last_sent_text = text
-                        sys.stderr.write(f"[FunASR Worker] 📝 PARTIAL: \"{state.streaming_text[-50:]}...\"\n")
+                        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}][{session_id}] 📝 PARTIAL: \"{state.streaming_text[-50:]}...\"\n")
                         sys.stderr.flush()
         except Exception as e:
             sys.stderr.write(f"[FunASR Worker] Pass 1 error: {e}\n")
@@ -701,6 +772,7 @@ def handle_streaming_chunk(
             session_id,
             timestamp_ms,
             trigger="silence",
+            online_models_cache=online_models_cache,
         )
 
     # ==== 处理 is_final 标记 ====
@@ -713,6 +785,7 @@ def handle_streaming_chunk(
             session_id,
             timestamp_ms,
             trigger="final",
+            online_models_cache=online_models_cache,
         )
 
 
@@ -724,6 +797,7 @@ def _trigger_pass2(
     session_id: str,
     timestamp_ms: int,
     trigger: str,
+    online_models_cache: Optional[Dict[str, object]] = None,
 ):
     """
     触发 Pass 2: 离线高精度识别 + 标点 + 智能分句
@@ -733,7 +807,7 @@ def _trigger_pass2(
     if not state.full_sentence_buffer:
         return
 
-    sys.stderr.write(f"[FunASR Worker] Triggering Pass 2 ({trigger})...\n")
+    sys.stderr.write(f"[FunASR Worker][{WORKER_ID}][{session_id}] Triggering Pass 2 ({trigger})...\n")
     sys.stderr.flush()
 
     try:
@@ -795,7 +869,7 @@ def _trigger_pass2(
                 
                 is_last = (i == len(sentences) - 1)
                 
-                sys.stderr.write(f"[FunASR Worker] 🎯 SENTENCE [{i+1}/{len(sentences)}]: \"{sentence[:50]}...\"\n")
+                sys.stderr.write(f"[FunASR Worker][{WORKER_ID}][{session_id}] 🎯 SENTENCE [{i+1}/{len(sentences)}]: \"{sentence[:50]}...\"\n")
                 sys.stderr.flush()
 
                 send_ipc_message({
@@ -814,6 +888,7 @@ def _trigger_pass2(
                     "end_time": int(sentence_end_time),
                     "sentence_index": i,
                     "total_sentences": len(sentences),
+                    "worker_id": WORKER_ID,
                 })
                 
                 current_time = sentence_end_time
@@ -826,24 +901,38 @@ def _trigger_pass2(
     # 重置状态，准备下一句
     state.reset()
 
+    # 同步重置 Pass 1 的前端缓存（非常关键）
+    # - state.reset() 只清掉了 state.online_cache（cif/decoder_fsmn 等）
+    # - 但 funasr_onnx 的 WavFrontendOnline 还有 reserve_waveforms/input_cache/lfr_splice_cache 等内部缓存
+    #   若不重置，会导致下一句/下一段仍然“吃到旧音频”，并在多 session 场景下更容易串线
+    if online_models_cache is not None:
+        try:
+            online_model = online_models_cache.get(session_id)
+            frontend = getattr(online_model, "frontend", None) if online_model is not None else None
+            if frontend is not None and hasattr(frontend, "cache_reset"):
+                frontend.cache_reset()
+        except Exception:
+            pass
+
 
 def handle_force_commit(
     asr_offline_model,
     punc_model,
     data: dict,
     sessions_cache: Dict[str, SessionState],
+    online_models_cache: Dict[str, object],
 ):
     """强制提交当前句子"""
     request_id = data.get("request_id", "default")
     session_id = data.get("session_id", request_id)
     timestamp_ms = int(time.time() * 1000)
 
-    sys.stderr.write(f"[FunASR Worker] force_commit received for session={session_id}\n")
+    sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] force_commit received for session={session_id}\n")
     sys.stderr.flush()
 
     state = sessions_cache.get(session_id)
     if not state:
-        sys.stderr.write(f"[FunASR Worker] No session state found for session={session_id}\n")
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] No session state found for session={session_id}\n")
         sys.stderr.flush()
         return
 
@@ -857,6 +946,7 @@ def handle_force_commit(
             session_id,
             timestamp_ms,
             trigger="force_commit",
+            online_models_cache=online_models_cache,
         )
     elif state.streaming_text and len(state.streaming_text) >= MIN_SENTENCE_CHARS:
         # 没有缓冲的音频，但有流式文本，直接提交流式文本
@@ -871,10 +961,19 @@ def handle_force_commit(
             "trigger": "force_commit_text_only",
             "language": "zh",
             "audio_duration": 0,
+            "worker_id": WORKER_ID,
         })
         state.reset()
+        # 同样重置 online 前端缓存
+        try:
+            online_model = online_models_cache.get(session_id)
+            frontend = getattr(online_model, "frontend", None) if online_model is not None else None
+            if frontend is not None and hasattr(frontend, "cache_reset"):
+                frontend.cache_reset()
+        except Exception:
+            pass
     else:
-        sys.stderr.write(f"[FunASR Worker] force_commit: no content to commit\n")
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] force_commit: no content to commit\n")
         sys.stderr.flush()
 
 
@@ -950,16 +1049,19 @@ def handle_batch_file(asr_offline_model, punc_model, data: dict):
 
 def main():
     try:
-        sys.stderr.write("[FunASR Worker] Starting FunASR 2-Pass Worker...\n")
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] Starting FunASR 2-Pass Worker...\n")
         sys.stderr.flush()
 
         # 加载模型
-        vad_model, asr_online_model, asr_offline_model, punc_model = load_funasr_onnx_models()
+        vad_model, asr_online_model_template, asr_offline_model, punc_model = load_funasr_onnx_models()
 
         sessions_cache: Dict[str, SessionState] = {}
-        send_ipc_message({"status": "ready"})
+        # 每个 session 一份独立的 online model（主要是隔离 WavFrontendOnline 内部缓存）
+        # 但通过 _clone_online_model_with_isolated_frontend 共享 ORT session，避免重复加载权重
+        online_models_cache: Dict[str, object] = {}
+        send_ipc_message({"status": "ready", "worker_id": WORKER_ID})
 
-        sys.stderr.write("[FunASR Worker] Ready! 2-Pass mode enabled.\n")
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] Ready! 2-Pass mode enabled. This worker is dedicated to one audio source.\n")
         sys.stderr.flush()
 
         while True:
@@ -978,23 +1080,25 @@ def main():
             session_id = data.get("session_id", request_id)
 
             if request_type == "reset_session":
-                sys.stderr.write(f"[FunASR Worker] Resetting session: {session_id}\n")
+                sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] Resetting session: {session_id}\n")
                 sys.stderr.flush()
                 sessions_cache.pop(session_id, None)
+                online_models_cache.pop(session_id, None)
                 continue
 
             if request_type == "force_commit":
-                handle_force_commit(asr_offline_model, punc_model, data, sessions_cache)
+                handle_force_commit(asr_offline_model, punc_model, data, sessions_cache, online_models_cache)
                 continue
 
             if request_type == "streaming_chunk":
                 handle_streaming_chunk(
                     vad_model,
-                    asr_online_model,
+                    asr_online_model_template,
                     asr_offline_model,
                     punc_model,
                     data,
                     sessions_cache,
+                    online_models_cache,
                 )
                 continue
 
@@ -1008,10 +1112,10 @@ def main():
             })
 
     except Exception as exc:
-        sys.stderr.write(f"[FunASR Worker] Fatal error: {exc}\n")
+        sys.stderr.write(f"[FunASR Worker][{WORKER_ID}] Fatal error: {exc}\n")
         sys.stderr.write(traceback.format_exc())
         sys.stderr.flush()
-        send_ipc_message({"status": "fatal", "error": str(exc)})
+        send_ipc_message({"status": "fatal", "error": str(exc), "worker_id": WORKER_ID})
         sys.exit(1)
 
 
